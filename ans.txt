@@ -1,0 +1,347 @@
+PES-VCS — Analysis Questions and Answers
+Author: PES1UG24CS477
+=========================================
+
+=======================================================
+PHASE 5: Branching and Checkout (Analysis Questions)
+=======================================================
+
+Q5.1: How would you implement `pes checkout <branch>`?
+What files need to change in .pes/, and what must happen
+to the working directory? What makes this operation complex?
+-------------------------------------------------------
+
+A branch in PES-VCS (like Git) is simply a file at
+.pes/refs/heads/<branch> containing a 64-char hex commit hash.
+Creating a branch is just creating that file.
+
+Files that need to change in .pes/:
+  1. HEAD — rewritten to "ref: refs/heads/<branch>" so future
+     commits update the new branch pointer.
+  2. .pes/refs/heads/<branch> — must exist and point to the
+     target commit (already exists if the branch exists).
+  3. .pes/index — must be rebuilt to exactly match the target
+     commit's tree so that `pes status` shows a clean state.
+
+Steps to implement pes checkout <branch>:
+  1. Read .pes/refs/heads/<branch> to get the target commit hash.
+     If the file doesn't exist, error: "branch not found".
+  2. Call object_read() on that hash to get the commit object.
+  3. Call commit_parse() to extract the root tree hash.
+  4. Recursively walk the tree (using tree_parse() on each
+     OBJ_TREE object):
+       - For each blob entry: write the blob's content to the
+         corresponding path in the working directory, creating
+         subdirectories as needed.
+       - For each tree entry: recurse into the subtree.
+  5. Delete any working-directory files that exist in the
+     current index but are absent from the target tree.
+  6. Rebuild .pes/index to match the target tree exactly
+     (mode, hash, mtime, size for each file).
+  7. Overwrite .pes/HEAD with "ref: refs/heads/<branch>\n".
+
+What makes this complex:
+  - Files in the current branch but absent in the target must
+    be deleted from the working directory.
+  - Files present in both branches with different content must
+    be overwritten without losing data.
+  - Subdirectories may need to be created or removed entirely.
+  - Uncommitted local changes to tracked files that differ
+    between branches must be detected and the checkout refused
+    to prevent data loss (see Q5.2).
+  - The index must be atomically rebuilt to match the new tree
+    so that status/add/commit work correctly after checkout.
+  - Detached HEAD mode (checking out a commit hash directly
+    instead of a branch name) requires writing the raw hash
+    into HEAD instead of a "ref: ..." symbolic reference.
+
+
+Q5.2: How would you detect a "dirty working directory" conflict
+when switching branches?
+-------------------------------------------------------
+
+A conflict exists when ALL THREE of these are true for a file:
+  1. The file is tracked in the current index.
+  2. The working-directory copy is locally modified (dirty).
+  3. The file differs between the current branch and the
+     target branch (so checkout would overwrite the change).
+
+Algorithm using only the index and object store:
+
+  Step 1: Load the current index into memory (index_load).
+
+  Step 2: For each entry in the index, call stat() on the
+          file path in the working directory.
+          - If stat() fails (ENOENT): file was deleted locally.
+            Mark it as dirty.
+          - If st_mtime != index.mtime_sec OR
+               st_size  != index.size:
+            The file has been modified since it was staged.
+            Mark it as dirty.
+          (No re-hashing needed — metadata comparison is the
+           same fast-path Git uses internally.)
+
+  Step 3: Read the target branch's commit object, extract its
+          root tree hash, and walk the tree recursively to
+          build a map of { path -> blob_hash } for the target.
+
+  Step 4: For each dirty file found in Step 2:
+          - Look up the same path in the target tree map.
+          - If the target has a DIFFERENT blob hash for that
+            path (or the path doesn't exist in the target):
+            → REFUSE checkout and print:
+              "error: Your local changes to '<path>' would be
+               overwritten by checkout. Please commit or stash
+               your changes before switching branches."
+
+  Step 5: If no conflicts found, proceed with checkout.
+
+Key insight: we never need to re-hash the working-directory
+file. The mtime+size metadata check is sufficient to detect
+that a file has changed, which is exactly how Git's index
+works for its "stat cache" optimization.
+
+
+Q5.3: What is "Detached HEAD" and how do you recover commits
+made in that state?
+-------------------------------------------------------
+
+Detached HEAD means .pes/HEAD contains a raw 64-char commit
+hash directly, instead of a symbolic reference like
+"ref: refs/heads/main".
+
+This happens when you run:
+  pes checkout <commit-hash>   (checking out a specific commit)
+instead of:
+  pes checkout <branch-name>
+
+What happens if you commit in detached HEAD state:
+  - commit_create() still works normally: it builds a tree,
+    creates a commit object with the current HEAD as parent,
+    writes the commit to the object store, and calls
+    head_update() which updates HEAD directly (since HEAD
+    contains a hash, not a ref, head_update writes the new
+    hash straight into HEAD_FILE).
+  - New commits ARE created and chained correctly via parent
+    pointers — the history is intact.
+  - BUT no branch file (.pes/refs/heads/*) is updated.
+    The commits are "floating" — reachable only by following
+    HEAD, which is a raw hash that will be lost the moment
+    you switch to another branch.
+
+Recovery procedure:
+  If you realize you're in detached HEAD and have made commits:
+
+  Option A — Before switching away (safest):
+    1. Note the current HEAD hash:
+         cat .pes/HEAD
+         # e.g., a1b2c3d4e5f6...
+    2. Create a new branch pointing to it:
+         echo "a1b2c3d4e5f6..." > .pes/refs/heads/my-work
+    3. Now checkout that branch normally:
+         pes checkout my-work
+    Your commits are now permanently reachable.
+
+  Option B — After switching away (if you forgot the hash):
+    In real Git, `git reflog` records every HEAD movement,
+    so you can find the lost hash. In PES-VCS (no reflog),
+    you would need to scan ALL objects in .pes/objects/,
+    read each OBJ_COMMIT, and find commits not reachable
+    from any branch ref — then manually create a branch
+    pointing to the tip of that chain.
+
+  Prevention: always create a branch before checking out a
+  specific commit if you plan to make changes:
+    echo "<hash>" > .pes/refs/heads/experiment
+    # then update HEAD to ref: refs/heads/experiment
+
+
+=======================================================
+PHASE 6: Garbage Collection (Analysis Questions)
+=======================================================
+
+Q6.1: Describe an algorithm to find and delete unreachable
+objects. What data structure would you use? Estimate object
+visits for 100,000 commits and 50 branches.
+-------------------------------------------------------
+
+Garbage collection uses a classic mark-and-sweep algorithm:
+
+MARK PHASE — identify all reachable objects:
+
+  Data structure: A hash set of ObjectID (32-byte SHA-256
+  keys). Implementation options:
+    - Open-addressing hash table with linear probing
+      (fast, cache-friendly, O(1) average insert/lookup)
+    - Sorted array of ObjectID with binary search
+      (O(log n) lookup, simpler to implement)
+    - Bitset indexed by a truncated hash (memory-efficient
+      but requires collision handling)
+
+  Algorithm:
+    1. Initialize an empty reachable set.
+    2. Collect all starting points (GC roots):
+         - Read .pes/HEAD (follow symbolic ref if needed)
+         - Read all files in .pes/refs/heads/
+         - Add each commit hash to a work queue.
+    3. Process the work queue (BFS or DFS):
+         For each commit hash in the queue:
+           a. If already in reachable set: skip (avoid cycles).
+           b. Add commit hash to reachable set.
+           c. object_read() the commit → commit_parse().
+           d. Add commit.tree to the work queue.
+           e. If commit.has_parent: add commit.parent to queue.
+         For each tree hash in the queue:
+           a. If already in reachable set: skip.
+           b. Add tree hash to reachable set.
+           c. object_read() the tree → tree_parse().
+           d. For each entry:
+              - If mode == 040000 (subtree): add to queue.
+              - Else (blob): add entry.hash to reachable set.
+    4. Mark phase complete.
+
+SWEEP PHASE — delete unreachable objects:
+
+    1. Walk all files under .pes/objects/ using opendir/readdir.
+    2. For each file, reconstruct its ObjectID:
+         - shard dir name (2 chars) + filename (62 chars)
+           = full 64-char hex → hex_to_hash()
+    3. If the ObjectID is NOT in the reachable set:
+         unlink() the file.
+    4. After processing each shard directory, try rmdir()
+       to remove it if now empty.
+
+Estimate for 100,000 commits, 50 branches:
+
+  Assumptions:
+    - Average directory depth: 3 levels
+    - Average files per directory: 10
+    - Objects per commit: ~1 commit + ~4 trees + ~10 blobs
+      = ~15 objects per commit on average
+
+  Mark phase visits:
+    - 100,000 commits × 15 objects = ~1,500,000 object reads
+    - With 50 branches, most commits are shared in history,
+      so the reachable set has ~1,500,000 entries total.
+
+  Sweep phase visits:
+    - Total objects in store ≈ same order: ~1,500,000 files
+    - Each file: reconstruct hash + set lookup = O(1)
+
+  Total: roughly 3,000,000 object visits (mark + sweep).
+  At ~10,000 object reads/sec (disk I/O bound): ~5 minutes.
+  With an in-memory object store or SSD: much faster.
+
+
+Q6.2: Describe the race condition between GC and a concurrent
+commit. How does Git avoid it?
+-------------------------------------------------------
+
+THE RACE CONDITION (step-by-step):
+
+  Time →   Commit Thread          GC Thread
+  ─────────────────────────────────────────────────────
+  T1       object_write(blob A)   —
+           (blob A now in store,
+            not yet in any tree)
+  T2       —                      Scan all refs → build
+                                  reachable set
+                                  (blob A is NOT reachable
+                                   — no commit/tree refs it)
+  T3       —                      Sweep: unlink(blob A)
+                                  (deleted!)
+  T4       object_write(tree T)   —
+           (tree T refs blob A)
+  T5       object_write(commit C) —
+           (commit C refs tree T)
+  T6       head_update(C)         —
+
+  Result: The repository is CORRUPT. Commit C → Tree T →
+  Blob A, but blob A no longer exists on disk. Any future
+  checkout or read of that file will fail with "object not
+  found".
+
+WHY THIS IS DANGEROUS:
+  The window between writing a loose object and making it
+  reachable via a ref update can be milliseconds to seconds.
+  GC running in that window can delete the object before it
+  is anchored to the ref graph.
+
+HOW GIT AVOIDS THIS:
+
+  1. Grace period (primary defense):
+     git gc --prune=<date> never deletes objects newer than
+     2 weeks by default (gc.pruneExpire = "2 weeks ago").
+     Since a commit operation completes in milliseconds,
+     any recently-written object is safe. The race window
+     is orders of magnitude smaller than the grace period.
+
+  2. Atomic object writes:
+     Git writes objects via temp-file + rename (same as our
+     object_write). A partially-written object is never
+     visible to GC — it either exists completely or not at
+     all. This prevents GC from seeing a corrupt half-object.
+
+  3. Pack-then-prune ordering:
+     git gc first packs all reachable objects into a packfile,
+     THEN prunes loose objects. The packing step re-verifies
+     reachability, so any object that becomes reachable between
+     the mark and sweep phases is captured in the pack.
+
+  4. Lock files:
+     Git uses .lock files (e.g., .git/refs/heads/main.lock)
+     during ref updates. GC checks for active lock files and
+     either waits or aborts, preventing it from running while
+     a commit is in progress.
+
+  5. Ref advertisement / connectivity check:
+     git fetch and git push perform connectivity checks before
+     accepting objects, ensuring the object graph is complete
+     before any ref is updated.
+
+  For PES-VCS, the simplest safe approach is the grace period:
+  never delete objects whose file mtime is less than N minutes
+  old (e.g., 10 minutes), which covers any in-flight commit.
+
+
+=======================================================
+SUMMARY OF ALL PHASES
+=======================================================
+
+Phase 1 — Object Storage:
+  Implemented object_write (header + SHA-256 + atomic write)
+  and object_read (read + integrity verify + header parse).
+  Key concept: content-addressable storage with directory
+  sharding and atomic writes via temp-file + rename.
+
+Phase 2 — Tree Objects:
+  Implemented tree_from_index with recursive write_tree_level
+  helper. Handles nested paths by grouping entries by their
+  top-level directory component and recursing.
+  Key concept: directory snapshots as linked tree objects.
+
+Phase 3 — Index (Staging Area):
+  Implemented index_load (text parse), index_save (atomic
+  write with sort), and index_add (read file → blob → update
+  entry with mtime/size metadata).
+  Key concept: staging area as a fast-diff cache using
+  metadata (mtime + size) instead of re-hashing.
+
+Phase 4 — Commits and History:
+  Implemented commit_create: tree_from_index → read parent
+  from HEAD → fill Commit struct → serialize → object_write
+  → head_update.
+  Key concept: commits as immutable snapshots linked by
+  parent pointers forming a DAG.
+
+Phase 5 — Branching and Checkout (Analysis):
+  Q5.1: checkout updates HEAD + working dir + index.
+  Q5.2: dirty detection via mtime/size metadata comparison.
+  Q5.3: detached HEAD = raw hash in HEAD; recover by creating
+        a branch pointing to the floating commit.
+
+Phase 6 — Garbage Collection (Analysis):
+  Q6.1: mark-and-sweep with a hash set; ~3M object visits
+        for 100K commits.
+  Q6.2: GC race condition avoided via grace period, atomic
+        writes, lock files, and pack-then-prune ordering.

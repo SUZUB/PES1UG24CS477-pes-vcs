@@ -41,16 +41,6 @@ int index_remove(Index *index, const char *path);
 IndexEntry* index_find(Index *index, const char *path);
 
 // Print the status of the working directory compared to the index and HEAD.
-// Output format:
-//   Staged changes:
-//     staged:     <path>
-//
-//   Unstaged changes:
-//     modified:   <path>
-//     deleted:    <path>
-//
-//   Untracked files:
-//     untracked:  <path>
 int index_status(const Index *index);
 
 #endif // INDEX_H
