@@ -238,4 +238,3 @@ int commit_create(const char *message, ObjectID *commit_id_out) {
 
     return 0;
 }
-/* Phase 4: commit_create - tree_from_index + parent + author + serialize + write + head_update */
