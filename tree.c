@@ -240,3 +240,4 @@ int tree_from_index(ObjectID *id_out) {
     free(entry_ptrs);
     return rc;
 }
+/* Phase 2 note: binary format is mode<SP>name<NUL><32-byte-hash> per entry */
