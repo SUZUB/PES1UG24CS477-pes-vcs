@@ -262,4 +262,3 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     *len_out = actual_data_len;
     return 0;
 }
-/* Phase 1 step: atomic write via temp+rename+fsync */
