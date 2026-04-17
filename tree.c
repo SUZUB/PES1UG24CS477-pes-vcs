@@ -240,4 +240,3 @@ int tree_from_index(ObjectID *id_out) {
     free(entry_ptrs);
     return rc;
 }
-/* Phase 2: write_tree_level recursive helper - groups entries by dir prefix */
