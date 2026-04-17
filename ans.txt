@@ -347,3 +347,4 @@ Phase 6 — Garbage Collection (Analysis):
         writes, lock files, and pack-then-prune ordering.
 
 # Q5.1 answer reviewed Fri Apr 17 03:03:52 PM UTC 2026
+# Q5.2 answer reviewed Fri Apr 17 03:06:53 PM UTC 2026
