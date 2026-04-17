@@ -301,3 +301,4 @@ int index_add(Index *index, const char *path) {
     // Step 5: Save the updated index
     return index_save(index);
 }
+/* Phase 3: index_load - parse text format, missing file = empty index */
