@@ -301,4 +301,3 @@ int index_add(Index *index, const char *path) {
     // Step 5: Save the updated index
     return index_save(index);
 }
-/* Phase 3: index_save - sort by path, temp file, fsync, atomic rename */
