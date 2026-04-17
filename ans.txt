@@ -345,3 +345,5 @@ Phase 6 — Garbage Collection (Analysis):
         for 100K commits.
   Q6.2: GC race condition avoided via grace period, atomic
         writes, lock files, and pack-then-prune ordering.
+
+# Q5.1 answer reviewed Fri Apr 17 03:03:52 PM UTC 2026
